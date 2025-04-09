@@ -1,0 +1,1561 @@
+# Single-Cell Omics: Assignment 2
+
+**Muhammad Ali (ma8308), Shyanon Rai (rais03), Lucia Galassi (lg3680)**
+
+------------------------------------------------------------------------
+
+## Setting up Python Environment for CellChat
+
+```{r}
+
+library(reticulate)
+use_python("/opt/anaconda3/bin/python", required = TRUE)  # Force Anaconda Python
+#reticulate::py_install("umap-learn", pip = TRUE)
+reticulate::py_module_available("umap")  # Should return TRUE
+reticulate::py_config()
+
+```
+
+
+## Loading the libraries
+
+```{r}
+
+suppressPackageStartupMessages({
+library(tidyverse)
+library(data.table)
+#library(Matrix)
+#library(hdf5r)
+library(lobstr)
+#library(R.utils)
+library(parallel)
+library(irlba)
+library(ggplot2)
+library(uwot)
+library(patchwork)
+library(Seurat)
+#library(SeuratData)
+#library(Azimuth)
+#library(SingleR)
+library(scIntegrationMetrics)
+library(harmony)
+library(ggsci)
+library(destiny)
+library(SeuratWrappers)
+library(scIntegrationMetrics)
+library(reshape2)
+library(CellChat)
+library(ggalluvial)
+library(NMF)
+library(umap)
+})
+
+```
+
+------------------------------------------------------------------------
+
+## Pre-processing the Data for Seurat
+
+### Reading the Files
+
+```{r}
+
+gz_files = list.files("/Users/ali/Downloads/GSE116256_RAW", 
+                      pattern = "\\gz$", 
+                      full.names = TRUE)
+
+unzipped_files = lapply(gz_files, R.utils::gunzip, remove = TRUE)
+
+
+```
+
+```{r}
+
+current_files = list.files("/Users/ali/Downloads/GSE116256_RAW", 
+                           full.names = TRUE)
+
+anno_files = grep("anno", current_files, value = TRUE)
+dem_files = grep("dem", current_files, value = TRUE)
+
+metadata_all = mclapply(anno_files, data.table::fread, sep="\t", header = TRUE, mc.cores=6)
+counts_matrix_all = mclapply(dem_files, data.table::fread, sep="\t", header = TRUE, mc.cores=6)
+
+if (!(length(metadata_all) == length(counts_matrix_all))) 
+{
+  print("Metadata and counts matrix do not match!")
+}
+
+```
+
+| At this point, we can also merge all the dataframes together before we turn them into a Seurat object. That way we can integrate multiple experiments into a single Seurat object so that we can use it with things like CellDex.
+
+### Conversion to Seurat-readable Matrix
+
+1.  This function reads the list of counts matrices and metadata, and turns them to a Seurat-readable format.
+2.  Next it creates a Seurat object for each of the counts matrix.
+3.  Third, it calculates the **mitochondrial percentage**.
+4.  It performs some standard workflows like normalization, finding variable features, scaling, and running PCA.
+5.  It creates a new column (**Coarse_Cell_Type**) in the metadata that removes the "-like" suffix from the cell type.
+6.  It also adds the metadata to the Seurat object.
+7.  And then it outputs a list of all the counts matrices, Seurat objects, and metadata.
+
+```{r}
+
+seurat_object_conversion = function(counts_list, metadata_list)
+
+{
+  counts_matrix_for_seurat = list()
+  metadata_for_seurat = list()
+  seurat_object_list = list()
+  
+  for (i in 1:length(counts_list))
+  {
+    
+    #Creating the Counts Matrix-------------------------------------------------
+    
+    counts_matrix_for_seurat[[i]] = counts_list[[i]] |>
+    column_to_rownames("Gene") |>
+    as.matrix()
+    
+    #Creating the Seurat Object-------------------------------------------------
+    
+    seurat_object_list[[i]] = CreateSeuratObject(counts = counts_matrix_for_seurat[[i]], 
+                                                 min.cells = 1, 
+                                                 min.features = 1)
+    
+    seurat_object_list[[i]][["pct_mito"]] = PercentageFeatureSet(seurat_object_list[[i]], pattern = "^MT-")
+  
+      
+    #Seurat Object Standard Processing------------------------------------------
+    
+    #seurat_object_list[[i]] = NormalizeData(seurat_object_list[[i]], 
+     #                                       normalization.method = "LogNormalize")
+    
+    #seurat_object_list[[i]] = FindVariableFeatures(seurat_object_list[[i]], 
+     #                                              verbose = FALSE)
+    
+    #seurat_object_list[[i]] = ScaleData(seurat_object_list[[i]], 
+     #                                   verbose = FALSE)
+    
+    #seurat_object_list[[i]] = RunPCA(seurat_object_list[[i]], 
+     #                                features = VariableFeatures(seurat_object_list[[i]]), 
+      #                               verbose = FALSE)
+    
+    #Metadata Processing--------------------------------------------------------
+    
+    metadata_for_seurat[[i]] = metadata_list[[i]] |>
+    column_to_rownames("Cell") |>
+    as.data.frame()
+    
+    metadata_for_seurat[[i]]$Coarse_Cell_Type = str_remove(metadata_for_seurat[[i]]$CellType, "-like")
+    
+    seurat_object_list[[i]] = AddMetaData(seurat_object_list[[i]], 
+                                          metadata = metadata_for_seurat[[i]])
+
+  }
+  
+  #---------------------------------------------------------------------------
+  
+  return(list(Seurat_Objects = seurat_object_list))
+}
+
+suppressWarnings({seurat_conversion = seurat_object_conversion(counts_matrix_all, metadata_all)})
+
+```
+
+------------------------------------------------------------------------
+
+## Part 1: Evaluating Batch Effects
+
+### 1.1. Merging the Datasets
+
+```{r}
+
+sample_ids = c(NA)
+
+for (i in 1:length(metadata_all))
+{
+  
+  if (gsub("_.*","",row.names(seurat_conversion$Seurat_Objects[[i]]@meta.data)[1]) == 
+      (gsub("_.*", "", metadata_all[[i]]$Cell[1])))
+  {
+    sample_ids[i] = (gsub("_.*", "", metadata_all[[i]]$Cell[1]))  
+  }
+
+}
+
+merged_seurat = merge(seurat_conversion$Seurat_Objects[[1]], 
+                      y = c(unlist(seurat_conversion$Seurat_Objects)[-1]),
+                      add.cell.ids = sample_ids, 
+                      project = "van Galen et al. 2019")
+
+merged_seurat
+
+table(merged_seurat$orig.ident, merged_seurat$Coarse_Cell_Type,
+      useNA = "ifany")
+      
+
+```
+
+| Clean up
+
+```{r}
+
+remove(counts_matrix_all)
+remove(metadata_all)
+remove(seurat_conversion)
+
+```
+
+```{r}
+
+Idents(merged_seurat) = "orig.ident"
+
+VlnPlot(merged_seurat, 
+        features = c("nFeature_RNA", "nCount_RNA", "pct_mito"), 
+        ncol = 3) 
+
+ggsave("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/violin_plot_merged_quality_check.png",
+       width = 19, height = 8, dpi = 300)
+
+```
+
+### 1.2. Normalization, Scaling, Variable Features, and PCA
+
+```{r}
+
+#options(future.globals.maxSize = 5 * 1024^3)  # Increase to 5 GiB
+
+merged_seurat = SCTransform(merged_seurat, 
+                            assay = "RNA", 
+                            verbose = TRUE)
+
+merged_seurat = RunPCA(merged_seurat, 
+                       assay = "SCT",
+                       features = VariableFeatures(merged_seurat), 
+                       verbose = FALSE)
+
+merged_seurat
+
+```
+
+| PCA Plot
+
+This shows clear batch effects between the two datasets.
+
+```{r}
+
+DimPlot(merged_seurat, 
+        reduction = "pca", 
+        shuffle = TRUE) +
+  theme(aspect.ratio = 1)
+
+```
+
+| Elbow plot for the first 50 principal components.
+
+```{r}
+
+ElbowPlot(merged_seurat, ndims = 50)
+
+```
+
+| UMAP based on the first 40 PCs as identified by the **elbow plot**.
+
+```{r}
+
+merged_seurat = RunUMAP(merged_seurat, dims = 1:40, verbose = FALSE)
+
+DimPlot(merged_seurat, 
+        reduction = "umap", 
+        shuffle = TRUE) +
+  theme(aspect.ratio = 1)
+
+ggsave("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/umap_before_batch_correction.png",
+       width = 10, height = 6, dpi = 300)
+
+```
+
+| We can also plot a UMAP where the feature embeddings for each data set can be plotted individually to see where each point on a UMAP is coming from.
+
+We can see that there are very clear batch effects here.
+
+```{r}
+
+DimPlot(merged_seurat, 
+        reduction = "umap", 
+        split.by = "orig.ident", 
+        shuffle = TRUE) +
+  theme(aspect.ratio = 1) 
+
+ggsave("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/indie_umap_before_correction.png",
+       width = 25, height = 8, dpi = 300)
+
+
+```
+
+```{r}
+
+DimPlot(merged_seurat, 
+        reduction = "umap", 
+        group.by = "Coarse_Cell_Type",
+        shuffle = TRUE) +
+  theme(aspect.ratio = 1)
+
+ggsave("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/cell_type_before_batch_correction.png",
+       width = 10, height = 6, dpi = 300)
+
+```
+
+### 1.3. Batch Effect Correction using Seurat
+
+The `IntegrateLayers` function integrates the two datasets using Canonical Correlation Analysis (CCA). The `orig.reduction` argument specifies the reduction slot to use for the integration. The new reduction is stored in the `new.reduction` slot.
+
+We are trying all 6 methods:
+
+-   Anchor-based CCA integration (`method=CCAIntegration`)
+-   Harmony (`method=HarmonyIntegration`)
+-   FastMNN (`method= FastMNNIntegration`)
+-   Anchor-based RPCA integration (`method=RPCAIntegration`) - Takes too much memory; couldn't do it on my laptop.
+-   Joint PCA (`method=JointPCAIntegration`) - Takes too much memory; couldn't do it on my laptop.
+-   scVI (`method=scVIIntegration`) - Requires an environment variable.
+
+```{r}
+
+#merged_seurat = IntegrateLayers(merged_seurat, 
+ #                               method = CCAIntegration, 
+  #                              orig.reduction = "pca", 
+   #                             new.reduction = "integrated.cca", 
+    #                            verbose = FALSE)
+
+merged_seurat = IntegrateLayers(merged_seurat, 
+                                method = HarmonyIntegration, 
+                                orig.reduction = "pca", 
+                                new.reduction = "integrated.harmony", 
+                                verbose = FALSE)
+
+merged_seurat = IntegrateLayers(merged_seurat, 
+                                method = FastMNNIntegration, 
+                                orig.reduction = "pca", 
+                                new.reduction = "integrated.mnn", 
+                                verbose = FALSE)
+
+#merged_seurat = IntegrateLayers(merged_seurat, 
+ #                               method = scVIIntegration, 
+  #                              orig.reduction = "pca", 
+   #                             new.reduction = "integrated.scv", 
+    #                            verbose = FALSE)
+
+#merged_seurat = IntegrateLayers(merged_seurat, 
+ #                               method = JointPCAIntegration, 
+  #                              orig.reduction = "pca", 
+   #                             new.reduction = "integrated.jpca", 
+    #                            verbose = FALSE)
+
+#merged_seurat = IntegrateLayers(merged_seurat, 
+ #                               method = RPCAIntegration, 
+  #                              orig.reduction = "pca", 
+   #                             new.reduction = "integrated.rpca", 
+    #                            verbose = FALSE)
+
+
+#merged_seurat = IntegrateLayers(merged_seurat, 
+ #                               method = scVIIntegration, 
+  #                              orig.reduction = "pca", 
+   #                             new.reduction = "integrated.scv", 
+    #                            verbose = FALSE)
+
+merged_seurat
+
+merged_seurat@reductions$pca
+
+```
+
+### 1.4. Qualitative Batch Correction Evaluation
+
+#### 1.4.1. CCA Evaluation
+
+| Plotting a UMAP using the new `integrated.cca` reduction.
+
+```{r}
+
+merged_seurat = RunUMAP(merged_seurat, 
+                        reduction = "integrated.cca", 
+                        reduction.name = "umap.cca", 
+                        dims = 1:40, verbose = FALSE)
+
+DimPlot(merged_seurat, 
+        reduction = "umap.cca", 
+        shuffle = TRUE) +
+  theme(aspect.ratio = 1)
+
+ggsave("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/cca_integration_umap.png",
+       width = 10, height = 6, dpi = 300)
+
+```
+
+```{r}
+
+DimPlot(merged_seurat, 
+        reduction = "umap.cca",
+        group.by = "Coarse_Cell_Type",
+        shuffle = TRUE) +
+  theme(aspect.ratio = 1) 
+
+ggsave("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/cca_cell_type.png",
+       width = 10, height = 6, dpi = 300)
+
+```
+
+```{r}
+
+DimPlot(merged_seurat, 
+        reduction = "umap.cca",
+        split.by = "orig.ident",
+        shuffle = TRUE) +
+  theme(aspect.ratio = 1) 
+
+ggsave("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/cca_split.png",
+       width = 25, height = 8, dpi = 300)
+
+```
+
+#### 1.4.2. Harmony Evaluation
+
+| Plotting a UMAP using the `integrated.harmony` reduction.
+
+```{r}
+
+merged_seurat = RunUMAP(merged_seurat, 
+                        reduction = "integrated.harmony", 
+                        reduction.name = "umap.harmony", 
+                        dims = 1:40, verbose = FALSE)
+
+DimPlot(merged_seurat, 
+        reduction = "umap.harmony", 
+        shuffle = TRUE) +
+  theme(aspect.ratio = 1) 
+
+ggsave("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/harmony_integration_umap.png",
+       width = 10, height = 6, dpi = 300)
+
+```
+
+```{r}
+
+DimPlot(merged_seurat, 
+        reduction = "umap.harmony",
+        group.by = "Coarse_Cell_Type",
+        shuffle = TRUE) +
+  theme(aspect.ratio = 1) 
+
+ggsave("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/harmony_cell_type.png",
+       width = 10, height = 6, dpi = 300)
+
+```
+
+```{r}
+
+DimPlot(merged_seurat, 
+        reduction = "umap.harmony",
+        split.by = "orig.ident",
+        shuffle = TRUE) +
+  theme(aspect.ratio = 1) 
+
+ggsave("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/harmony_split.png",
+       width = 25, height = 8, dpi = 300)
+
+```
+
+#### 1.4.3. MNN Evaluation
+
+| Plotting a UMAP using the `integrated.harmony` reduction.
+
+```{r}
+
+merged_seurat = RunUMAP(merged_seurat, 
+                        reduction = "integrated.mnn", 
+                        reduction.name = "umap.mnn", 
+                        dims = 1:40, verbose = FALSE)
+
+DimPlot(merged_seurat, 
+        reduction = "umap.mnn", 
+        shuffle = TRUE) +
+  theme(aspect.ratio = 1) 
+
+ggsave("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/mnn_integration_umap.png",
+       width = 10, height = 6, dpi = 300)
+
+```
+
+```{r}
+
+DimPlot(merged_seurat, 
+        reduction = "umap.mnn",
+        group.by = "Coarse_Cell_Type",
+        shuffle = TRUE) +
+  theme(aspect.ratio = 1) 
+
+ggsave("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/mnn_cell_type.png",
+       width = 10, height = 6, dpi = 300)
+
+```
+
+```{r}
+
+DimPlot(merged_seurat, 
+        reduction = "umap.mnn",
+        split.by = "orig.ident",
+        shuffle = TRUE) +
+  theme(aspect.ratio = 1) 
+
+ggsave("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/mnn_split.png",
+       width = 25, height = 8, dpi = 300)
+
+```
+
+### 1.5. Quantitative Batch Correction Evaluation
+
+| Here we used the `scIntegrationMetrics` package to evaluate the batch correction methods.
+
+For all metrics, Harmony seems to be outperforming CCA, MNN, and the pre-correction metrics.
+
+```{r}
+
+#pre_correction_metrics = getIntegrationMetrics(merged_seurat, 
+#                                               meta.label = "Coarse_Cell_Type",
+#                                               meta.batch = "orig.ident",
+#                                               method.reduction = "pca",
+#                                               ndim = 40,
+#                                               iLISI_perplexity = 20)
+
+#harmony_metrics = getIntegrationMetrics(merged_seurat, 
+ #                                       meta.label = "Coarse_Cell_Type",
+  #                                      meta.batch = "orig.ident",
+   #                                     method.reduction = "integrated.harmony",
+    #                                    ndim = 40,
+     #                                   iLISI_perplexity = 20)
+
+#cca_metrics = getIntegrationMetrics(merged_seurat, 
+ #                                   meta.label = "Coarse_Cell_Type",
+  #                                  meta.batch = "orig.ident",
+   #                                 method.reduction = "integrated.cca",
+    #                                ndim = 40,
+     #                               iLISI_perplexity = 20)
+
+#mnn_metrics = getIntegrationMetrics(merged_seurat, 
+ #                                   meta.label = "Coarse_Cell_Type",
+  #                                  meta.batch = "orig.ident",
+   #                                 method.reduction = "integrated.mnn",
+    #                                ndim = 40,
+     #                               iLISI_perplexity = 20)
+
+#integration_metrics_df = as.data.frame(t(data.frame(Pre_Correction = unlist(pre_correction_metrics),
+ #                                                   Harmony = unlist(harmony_metrics))))
+  #                                                  #CCA = unlist(cca_metrics),
+   #                                                 #MNN = unlist(mnn_metrics))))
+
+
+```
+
+### 1.6. Hyperparameter Tuning for Integration Methods
+
+```{r}
+
+#merged_seurat = IntegrateLayers(merged_seurat,
+  #method = CCAIntegration,
+  #orig.reduction = "pca",
+  #new.reduction = "integrated.cca.tuned",
+  #dims = 1:20,  # Using the first 20 dimensions
+  #k.weight = 50,  # Considering 50 neighbors for weighting
+  #verbose = FALSE)
+
+#cca_metrics_tuned = getIntegrationMetrics(merged_seurat, 
+ #                                   meta.label = "Coarse_Cell_Type",
+  #                                  meta.batch = "orig.ident",
+   #                                 method.reduction = "integrated.cca.tuned",
+    #                                ndim = 40,
+     #                               iLISI_perplexity = 20)
+
+#-------------------------------------------------------------------------------
+
+merged_seurat = IntegrateLayers(merged_seurat,
+  method = HarmonyIntegration,
+  orig.reduction = "pca",
+  new.reduction = "integrated.harmony.tuned",
+  theta = 2,  # Setting theta to 2
+  lambda = 0.5,  # Setting lambda to 0.5 - Elastic-net Regression
+  sigma = 0.2,  # Setting sigma to 0.2
+  verbose = FALSE)
+
+harmony_metrics_tuned = getIntegrationMetrics(merged_seurat, 
+                                        meta.label = "Coarse_Cell_Type",
+                                        meta.batch = "orig.ident",
+                                        method.reduction = "integrated.harmony.tuned",
+                                        ndim = 40,
+                                        iLISI_perplexity = 20)
+
+#-------------------------------------------------------------------------------
+
+#merged_seurat = IntegrateLayers(merged_seurat,
+ # method = FastMNNIntegration,
+  #orig.reduction = "pca",
+  #new.reduction = "integrated.mnn.tuned",
+  #k = 20,  # Considering 20 nearest neighbors
+  #d = 50,  # Using 50 dimensions for integration
+  #verbose = FALSE)
+
+
+#mnn_metrics_tuned = getIntegrationMetrics(merged_seurat, 
+ #                                   meta.label = "Coarse_Cell_Type",
+  #                                  meta.batch = "orig.ident",
+   #                                 method.reduction = "integrated.mnn.tuned",
+    #                                ndim = 40,
+     #                               iLISI_perplexity = 20)
+
+#-------------------------------------------------------------------------------
+
+integration_metrics_df_tuned = as.data.frame(t(data.frame(Pre_Correction = unlist(pre_correction_metrics),
+                                                    Harmony = unlist(harmony_metrics),
+                                                    CCA = unlist(cca_metrics),
+                                                    MNN = unlist(mnn_metrics),
+                                                    Harmony_Tuned = unlist(harmony_metrics_tuned),
+                                                    CCA_Tuned = unlist(cca_metrics_tuned),
+                                                    MNN_Tuned = unlist(mnn_metrics_tuned))))
+
+
+integration_metrics_df_tuned$Method = rownames(integration_metrics_df_tuned)
+
+                                       
+integration_metrics_df_tuned_melted = melt(integration_metrics_df_tuned, 
+                                           id.vars = "Method")
+
+ggplot(integration_metrics_df_tuned_melted, aes(x = Method, y = value, fill = Method)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~ variable, scales = "free_y") +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),  # Removes grid lines
+    panel.border = element_blank(),  # Removes panel border
+    axis.line = element_blank(),  # Removes axis lines
+  ) +
+  labs(title = "Comparison of Integration Methods Across Metrics",
+       x = "Integration Method",
+       y = "Metric Value") +
+  scale_fill_brewer(palette = "Set2")
+
+ggsave("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/batch_correction_metrics.png",
+       width = 17, height = 9, dpi = 300, bg = "white")
+
+```
+
+| Since the tuned CCA is the best performing method to remove batch effects, we will use that reduction going forward.
+
+## Part 2: Psuedotime Analysis
+
+### 2.1. Subsetting the Data
+
+Here we show all the cell types and that the data clusters nicely by cell type.
+
+```{r}
+
+Idents(merged_seurat) = "Coarse_Cell_Type"
+
+merged_seurat = RunUMAP(merged_seurat, 
+                        reduction = "integrated.harmony", 
+                        reduction.name = "umap.cca.tuned", 
+                        dims = 1:40, verbose = FALSE)
+
+DimPlot(merged_seurat, 
+        reduction = "umap.cca.tuned", 
+        shuffle = TRUE) +
+  theme(aspect.ratio = 1) 
+
+ggsave("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/tuned_cca.png",
+       width = 10, height = 6, dpi = 300)
+
+```
+
+| Next, we subset the data to get the myeloid lineage cells.
+
+```{r}
+
+myeloid_lineage = c("GMP", "Mono", "cDC", "ProMono", "earlyEry", "lateEry", "pDC")
+
+Idents(merged_seurat) = "Coarse_Cell_Type"
+
+subset_seurat = subset(merged_seurat, 
+                       idents = myeloid_lineage)
+
+table(subset_seurat@meta.data$Coarse_Cell_Type, 
+      subset_seurat@meta.data$PredictionRefined)
+
+```
+
+| Visualizing the balanced dataset using a UMAP
+
+```{r}
+
+DimPlot(subset_seurat, 
+        reduction = "umap.harmony", 
+        shuffle = TRUE) +
+  theme(aspect.ratio = 1) 
+
+ggsave("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/tuned_cca_subset.png",
+       width = 10, height = 6, dpi = 300)
+
+```
+
+### 2.2. Pseudotime Analysis using Variable Features
+
+| Here we are going to use the differential genes (2000 variable features) stored in the `RNA` assay to run a diffusion map. We can access these genes using `VariableFeatures` function.
+
+So we tried using multiple Ks and distance metrics. They are as follows:
+
+-   `n_eigs`: 3 - 6
+-   `k`: 30, 50, 100, and the default (any random number between 100 - n)
+-   `distance`: "euclidean" & "cosine"
+
+We get best results with `n_eigs = 3`, `k = 30`, and `distance = "cosine"`.
+
+```{r}
+
+set.seed(1010)
+
+exprs_mat = LayerData(subset_seurat, assay = "SCT", layer = "data")
+
+exprs_mat = exprs_mat[VariableFeatures(subset_seurat), ]
+
+exprs_mat = as.matrix(exprs_mat)
+
+dm = DiffusionMap(t(exprs_mat), 
+                  n_eigs = 3, 
+                  rotate = TRUE,
+                  k = 30,
+                  distance = "cosine",
+                  verbose = TRUE)
+dpt = DPT(dm)
+
+dm_df = as.data.frame(dm) |> 
+  select(DC1, DC2) |>
+  mutate(DPT = dpt$dpt)
+
+subset_seurat = AddMetaData(subset_seurat, 
+                            metadata = dm_df)
+
+head(subset_seurat@meta.data[,c("DC1", "DC2", "DPT")])
+
+```
+
+```{r}
+
+ggplot(subset_seurat@meta.data, 
+       aes(x = DC1, y = DC2, color = Coarse_Cell_Type)) +
+  geom_point(size = 1.2) +
+  theme(aspect.ratio = 0.7, axis.ticks = element_blank(), axis.text = element_blank()) +
+  labs(title = "Diffusion Map of Cell Types") +
+  theme_minimal()
+
+ggsave("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/k30_psuedotime_map.png",
+       width = 10, height = 6, dpi = 300, bg = "white")
+
+```
+
+| Plotting the diffusion map according to the Psuedotime.
+
+```{r}
+
+ggplot(subset_seurat@meta.data, 
+       aes(x = DC1, y = DC2, color = DPT)) +
+  geom_point(size = 1) +
+  theme(aspect.ratio = 0.7, axis.ticks = element_blank(), axis.text = element_blank()) +
+  labs(title = "Diffusion Components plotted according to Psuedotime") +
+  scale_color_distiller(palette = "RdYlBu") +
+  theme_minimal() 
+
+ggsave("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/k30_psuedotime_dpt.png",
+       width = 10, height = 6, dpi = 300, bg = "white")
+
+```
+
+```{r}
+
+myeloid_markers = c("CD14", "FCGR3A", "CD1C", "CD34", "MPO", "LYZ")
+
+# Extract expression and pseudotime
+marker_expr = t(LayerData(subset_seurat, assay = "SCT", layer = "data")[myeloid_markers, ])
+plot_data = cbind(marker_expr, 
+                  subset_seurat@meta.data[rownames(marker_expr),c("DPT", "Coarse_Cell_Type", "PredictionRefined")])
+
+ggplot(subset_seurat@meta.data) +
+  geom_boxplot(aes(x = Coarse_Cell_Type, y = DPT, fill = PredictionRefined)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme_minimal() +
+  labs(title = "Pseudotime Distribution by Malignancy Status")
+
+
+```
+
+```{r}
+
+ggplot(plot_data) +
+  geom_smooth(aes(x = DPT, y = CD14, color = "CD14"),
+              method = "loess", se = FALSE) +
+  geom_smooth(aes(x = DPT, y = CD34, color = "CD34"),
+              method = "loess", se = FALSE) +
+  geom_smooth(aes(x = DPT, y = FCGR3A, color = "FCGR3A"),
+              method = "loess", se = FALSE) +
+  geom_smooth(aes(x = DPT, y = CD1C, color = "CD1C"),
+              method = "loess", se = FALSE) +
+  geom_smooth(aes(x = DPT, y = MPO, color = "MPO"),
+              method = "loess", se = FALSE) +
+  geom_smooth(aes(x = DPT, y = LYZ, color = "LYZ"),
+              method = "loess", se = FALSE) +
+  labs(title = "Marker Expression Along Pseudotime",
+       x = "Pseudotime", y = "Expression") +
+  theme_minimal()
+
+ggsave("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/marker_line_graph.png",
+       width = 10, height = 6, dpi = 300, bg = "white")
+
+```
+
+```{r}
+
+ggplot(subset_seurat@meta.data) +
+  geom_point(aes(x = DC1, y = DC2, 
+                 color = DPT, 
+                 shape = PredictionRefined), alpha = 0.7,
+             size = 1.2) +
+  scale_color_viridis_c(option = "plasma") +
+  labs(title = "Pseudotime Trajectory with Malignancy Status") +
+  theme_minimal()
+
+ggsave("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/malignancy_psuedotime.png",
+       width = 10, height = 6, dpi = 300, bg = "white")
+
+```
+
+```{r}
+
+ggplot(subset_seurat@meta.data, 
+       aes(x = DPT, y = Coarse_Cell_Type, color = Coarse_Cell_Type)) +
+  geom_jitter(width = 0.2, height = 0.2) +
+  geom_boxplot(width = 0.8, linewidth = 0.8, color = "gray20", fill = NA, outlier.colour = NA) +
+  theme(aspect.ratio = 0.7, axis.ticks = element_blank(), axis.text = element_blank()) +
+  labs(title = "Pseudotime of Cell Types") +
+  theme_minimal()
+
+```
+
+```{r}
+
+
+ggplot(subset_seurat@meta.data, 
+       aes(x = DPT, y = PredictionRefined, color = Coarse_Cell_Type)) +
+  geom_jitter(width = 0.2, height = 0.2) +
+  geom_boxplot(width = 0.8, linewidth = 0.8, color = "gray20", fill = NA, outlier.colour = NA) +
+  theme(aspect.ratio = 0.7) +
+  theme_minimal()
+
+```
+
+
+
+```{r}
+
+test_parameters = function(n_eigs, sigma) 
+{
+  dm_test = DiffusionMap(t(exprs_mat), n_eigs = n_eigs, sigma = sigma)
+  dpt_test = DPT(dm_test)
+  return(cor(dpt$dpt, dpt_test$dpt)) # Compare with original pseudotime
+}
+
+suppressWarnings({
+  print(paste0("The correlation between the original pseudotime and the pseudotime with 3 eigenvectors and local sigma is: ", test_parameters(n_eigs = 3, sigma = "local")))
+  
+  print(paste0("The correlation between the original pseudotime and the pseudotime with 5 eigenvectors and global sigma is: ", test_parameters(n_eigs = 5, sigma = "global")))
+  
+  print(paste0("The correlation between the original pseudotime and the pseudotime with 5 eigenvectors and local sigma is: ", test_parameters(n_eigs = 10, sigma = "global")))
+})
+
+```
+
+## Part 3: Cell-cell Communication using CellChat
+
+### 3.1. Creating a CellChat Object
+
+We start by creating a `CellChat` object from our Seurat object. 
+
+```{r}
+
+merged_seurat = readRDS("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/merged_seurat.rds")
+
+merged_seurat@meta.data$Malignancy_Cell_Types = merged_seurat@meta.data$Coarse_Cell_Type
+
+merged_seurat@meta.data$Malignancy_Cell_Types[merged_seurat@meta.data$PredictionRefined == "malignant"] = "Malignant"
+
+head(merged_seurat@meta.data[,c("PredictionRefined", "Coarse_Cell_Type", "Malignancy_Cell_Types")], 10)
+
+
+```
+
+```{r}
+
+data.input = merged_seurat[["SCT"]]@data # normalized data matrix
+# For Seurat version >= “5.0.0”, get the normalized data via `seurat_object[["RNA"]]$data`
+labels = Idents(merged_seurat)
+meta = data.frame(labels = labels, row.names = names(labels)) # create a dataframe of the cell labels
+
+```
+
+
+```{r}
+
+cellchat = createCellChat(object = merged_seurat, 
+                          group.by = "Malignancy_Cell_Types",
+                          assay = "SCT")
+
+```
+### 3.2. Setting up the CellChat Database
+
+Before we can use the `CellChat` object, we need to set the ligand-receptor interaction database and identify over-expressed ligands and receptors.
+
+The database CellChatDB is a manually curated database of literature-supported ligand-receptor interactions in both human and mouse. Some of the highlights are as follows:
+
+- ~3,300 validated molecular interactions
+- ~40% of secrete autocrine/paracrine signaling interactions 
+- ~17% of extracellular matrix (ECM)-receptor interactions 
+- ~13% of cell-cell contact interactions 
+- ~30% non-protein signaling 
+
+It should be noted that for molecules that are not directly related to genes measured in scRNA-seq, CellChat v2 estimates the expression of ligands and receptors using those molecules’ key mediators or enzymes for potential communication mediated by non-proteins.
+
+When analyzing human samples, use the database CellChatDB.human; when analyzing mouse samples, use the database CellChatDB.mouse. 
+
+CellChatDB categorizes ligand-receptor pairs into different types:
+- “Secreted Signaling”
+- “ECM-Receptor”
+- “Cell-Cell Contact”
+- “Non-protein Signaling” (Not used by Default)
+
+```{r}
+
+CellChatDB = CellChatDB.human # use CellChatDB.mouse if running on mouse data
+
+showDatabaseCategory(CellChatDB)
+
+```
+
+| The function `subsetDB` allows us to filter the CellChatDB. And when you use `subsetDB` without any parameters, it gives you all the database except non-protein signaling (which is metabolic and synaptic).
+
+```{r}
+
+# use a subset of CellChatDB for cell-cell communication analysis
+#CellChatDB.use = subsetDB(CellChatDB, search = "Secreted Signaling", key = "annotation") # use Secreted Signaling
+
+# Only uses the Secreted Signaling from CellChatDB v1
+#  CellChatDB.use <- subsetDB(CellChatDB, search = list(c("Secreted Signaling"), c("CellChatDB v1")), key = c("annotation", "version"))
+
+# use all CellChatDB except for "Non-protein Signaling" for cell-cell communication analysis
+# CellChatDB.use <- subsetDB(CellChatDB)
+
+
+# use all CellChatDB for cell-cell communication analysis
+# CellChatDB.use <- CellChatDB # simply use the default CellChatDB. We do not suggest to use it in this way because CellChatDB v2 includes "Non-protein Signaling" (i.e., metabolic and synaptic signaling). 
+
+# set the used database in the object
+cellchat@DB = subsetDB(CellChatDB)
+
+```
+
+
+### 3.3. Identifying Over-expressed Ligands and Receptors
+
+```{r}
+
+cellchat = subsetData(cellchat) # This step is necessary even if using the whole database
+
+```
+
+
+```{r}
+
+cellchat = identifyOverExpressedGenes(cellchat)
+cellchat = identifyOverExpressedInteractions(cellchat)
+# project gene expression data onto PPI (Optional: when running it, USER should set `raw.use = FALSE` in the function `computeCommunProb()` in order to use the projected data)
+
+```
+
+CellChat infers biologically significant cell-cell communication by assigning each interaction with a probability value and peforming a permutation test. This assigns p-values to the interactions. 
+
+By default, CellChat uses `type = "triMean"` for the `computeCommunProbPathway` function. This is essentially truncated mean at 25% of the data, which means that the average gene expression is zero if the percent of expressed cells in one group is less than 25%.
+
+However, we can also set the truncated mean value to be something lower. For example, to use 10% truncated mean, we can set `type = "truncatedMean"` and `trim = 0.1`.
+
+We can also find out the average expression of different features across cell types using `computeAveExpr` at different values of truncated mean. 
+
+```{r}
+
+computeAveExpr(cellchat, features = c("CXCL12","CXCR4"), type =  "truncatedMean", trim = 0.25)
+print("-------------------------------------------------")
+computeAveExpr(cellchat, features = c("CXCL12","CXCR4"), type =  "truncatedMean", trim = 0.1)
+
+```
+
+Now, as we can see that most of our cells get zeroed out at a truncated mean of 25%, we will use a truncated mean of 10% for the probability calculation. However, a truncated mean of 25% is more stringent so we get fewer but stronger interactions. 
+
+We can filter out the cell-cell communication using `filterCommunication` if there are only few cells in certain cell groups. By default, the minimum number of cells required in each cell group for cell-cell communication is 10. However, we are going to use a more stringent filter of `min.cells = 100`.
+
+
+```{r}
+
+cellchat = computeCommunProb(cellchat, 
+                             type = "truncatedMean",
+                             trim = 0.25)
+
+#> triMean is used for calculating the average gene expression per cell group. 
+#> [1] ">>> Run CellChat on sc/snRNA-seq data <<< [2024-02-14 00:32:35.767285]"
+#> [1] ">>> CellChat inference is done. Parameter values are stored in `object@options$parameter` <<< [2024-02-14 00:33:13.121225]"
+
+cellchat = filterCommunication(cellchat, min.cells = 30)
+
+```
+
+### 3.4. Extracting Interaction Information
+
+The function `subsetCommunication` can be used to access the inferred cell-cell communications of interest. It returns all the inferred cell-cell communications at the level of ligands/receptors. Set `slot.name = "netP"` to access the the inferred communications at the level of signaling pathways.
+
+
+
+```{r}
+
+interaction_information = subsetCommunication(cellchat)
+
+pathway_information = subsetCommunication(cellchat, 
+                                          slot.name = "netP") 
+
+#df.net <- subsetCommunication(cellchat, sources.use = c(1,2), targets.use = c(4,5)) #gives the inferred cell-cell communications sending from cell groups 1 and 2 to cell groups 4 and 5.
+
+#df.net <- subsetCommunication(cellchat, signaling = c("WNT", "TGFb")) #gives the inferred cell-cell communications mediated by signaling WNT and TGFb.
+
+
+```
+
+| Here we are calculating the communication probability on signaling pathway level by summarizing the communication probabilities of all ligand-receptors interactions associated with each signaling pathway.
+
+```{r}
+
+cellchat = computeCommunProbPathway(cellchat)
+
+```
+
+### 3.5. Aggregating the Network
+
+CellChat calculates the aggregated cell-cell communication network by counting the number of links or summarizing the communication probability. Users can also calculate the aggregated network among a subset of cell groups by setting `sources.use` and `targets.use`.
+
+
+```{r}
+
+cellchat = aggregateNet(cellchat)
+
+groupSize = as.numeric(table(cellchat@idents)) #This is the number of cells of each type. 
+
+png("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/interaction_counts.png",
+    width = 12, height = 12, units = "in", res = 300, bg = "white")
+
+netVisual_circle(cellchat@net$count, 
+                 vertex.weight = groupSize, 
+                 weight.scale = T, 
+                 label.edge= F, 
+                 title.name = "Number of interactions")
+
+dev.off()
+
+png("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/interaction_weight.png",
+    width = 12, height = 12, units = "in", res = 300, bg = "white")
+
+netVisual_circle(cellchat@net$weight, 
+                 vertex.weight = groupSize, 
+                 weight.scale = T, 
+                 label.edge= F, 
+                 title.name = "Interaction weights/strength")
+
+dev.off()
+
+```
+
+Due to the complicated cell-cell communication network, we can examine the signaling sent from each cell group. Here we also control the parameter `edge.weight.max` so that we can compare edge weights between differet networks.
+
+So, in this step, we are simplifying the network. 
+
+Here's an explanation for what's going on in the plots:
+
+- The size of the dot on the names of each cell represents the amount of cells of that type. 
+- 
+
+```{r}
+
+mat = cellchat@net$weight
+#par(mfrow = c(3,4), xpd=TRUE)
+
+for (i in 1:nrow(mat)) 
+{
+  mat2 = matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+  mat2[i, ] = mat[i, ]
+  
+  png(paste0("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/Individual/CellChat_Network_", 
+             rownames(mat)[i], ".png"), width = 12, height = 12, units = "in", res = 300, bg = "white")
+
+  netVisual_circle(mat2, 
+                   vertex.weight = groupSize, 
+                   weight.scale = T, 
+                   edge.weight.max = max(mat), #The edge size is scaled by the maximum weight.
+                   title.name = rownames(mat)[i])
+  
+  dev.off()
+}
+
+
+```
+
+```{r}
+
+interaction_information
+
+```
+
+| We can also visualize specific pathways using the `signaling` parameter of the `netVisual_aggregate` function. 
+
+The graph below shows in the BLTA pathway (from `interaction_information$pathway_name`). We get the cells that are sources and targets. Arrows go from sources to target (e.g. the ligand BLTA goes from B to T cells and B to NK cells).
+
+We can also access the pathway infromation from `cellchat@netP$pathways`.
+
+```{r}
+
+cellchat@netP$pathways
+
+levels(cellchat@idents)
+
+```
+
+```{r}
+
+unique(interaction_information$pathway_name[interaction_information$target == "Malignant"])
+unique(interaction_information$pathway_name[interaction_information$source == "Malignant"])
+
+interaction_information[interaction_information$pathway_name == "CLEC",]
+
+
+```
+
+
+```{r}
+
+pathways.show = c("APP")
+
+# Hierarchy plot
+# Here we define `vertex.receive` so that the left portion of the hierarchy plot shows signaling to fibroblast and the right portion shows signaling to immune cells 
+vertex.receiver = seq(1,4) # a numeric vector. 
+
+png(paste0("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/", pathways.show, ".png"),
+    width = 12, height = 12, units = "in", res = 300, bg = "white")
+
+netVisual_aggregate(cellchat, 
+                    signaling = pathways.show,  
+                    vertex.receiver = vertex.receiver)
+
+dev.off()
+# Circle plot
+#par(mfrow=c(1,1))
+netVisual_aggregate(cellchat,
+                    signaling = pathways.show, 
+                    layout = "circle")
+
+```
+
+| Here we are visualizing this with a chord figure. The width of the edge represents the strength of the interaction (`interaction_information$prob`). 
+
+
+```{r}
+
+
+
+png(paste0("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/", pathways.show, "_chord.png"),
+    width = 12, height = 12, units = "in", res = 300, bg = "white")
+
+netVisual_individual(cellchat, signaling = pathways.show, layout = "chord")
+
+dev.off()
+
+```
+```{r}
+
+png(paste0("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/", pathways.show, "_chord_gene.png"),
+    width = 12, height = 12, units = "in", res = 300, bg = "white")
+
+netVisual_chord_gene(cellchat, 
+                     signaling = pathways.show)
+
+dev.off()
+
+```
+
+```{r}
+
+png("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/heatmap.png",
+    width = 12, height = 8, units = "in", res = 300, bg = "white")
+
+netVisual_heatmap(cellchat, signaling = pathways.show, color.heatmap = "Reds")
+#> Do heatmap based on a single object
+
+dev.off()
+```
+
+### 3.6. Subsetting the CellChat Object 
+
+| We can also subset the `cellchat` to specific cell types using the `subsetCellChat` function. Here we can pass specific `idents` using the `idents.use` parameter. 
+
+And then we can plot the chord chart for only these cells. 
+
+```{r}
+
+subsetCellChat(cellchat, 
+               idents.use = c("B", "T", "Plasma"))
+
+netVisual_individual(subsetCellChat(cellchat, 
+               idents.use = c("B", "T", "Plasma")), 
+               signaling = pathways.show, 
+               layout = "chord")
+
+
+```
+### 3.7. Other Analsyes
+
+#### 3.7.1. Contribution Analysis
+
+```{r}
+
+
+netAnalysis_contribution(cellchat, signaling = cellchat@netP$pathways[2])
+
+
+```
+
+
+```{r}
+interaction_information
+```
+
+#### 3.7.2. Specific Bubble Plots
+
+Here we can define bubble plots for all ligand-receptor interactions for cell pairs. The sources and targets are defined according to the levels of idents of the `cellchat` object (`levels(cellchat@idents)`). For instance, in our case, we want to understand how GMP, ProMono, and Monocytes are interacting with each other. So, we will classify the `sources.use = 5` (factor level of GMP), and the `targets.use = c(8, 14)`. 
+
+This gives us all the ligand-receptor pairs, and their interaction strengths (communication probabilities) between GMP and ProMono, and GMP and Monocytes.
+
+```{r}
+
+levels(cellchat@idents)
+
+sources = c(1, 2, 3, 10, 16)
+targets = c(8)
+
+png("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/bubble_plot.png",
+    width = 10, height = 6, units = "in", res = 300, bg = "white")
+
+netVisual_bubble(cellchat, 
+                 sources.use = sources, 
+                 targets.use = targets,
+                 remove.isolate = FALSE)
+
+dev.off()
+
+```
+Instead of looking at all the pathways, we can specify specific signalling pathways using `signaling = c("MIF")`.
+
+```{r}
+
+netVisual_bubble(cellchat, 
+                 sources.use = sources, 
+                 targets.use = targets,
+                 signaling = c("PECAM1", "MIF", "APP"),
+                 remove.isolate = FALSE)
+
+
+```
+
+| We can also do the same thing in reverse where we first extract all the enriched receptor-ligand pairs for a specific pathway using `extractEnrichedLR` and then visualize the enriched pairs using the `pairLR.use` parameter. The input to this parameter has to be a dataframe with a single column named "interaction_name". 
+
+```{r}
+
+pairLR.use = extractEnrichedLR(cellchat, signaling = c("MIF"))
+
+netVisual_bubble(cellchat, 
+                 sources.use = sources, 
+                 targets.use = targets, 
+                 pairLR.use = pairLR.use, 
+                 remove.isolate = TRUE)
+
+```
+
+#### 3.7.3. Specific Chord Analysis
+
+| We can do the same thing with chord diagrams where we can specify sources using `sources.use` and targets using `targets.use` (based on the levels of idents of the `cellchat` object - `levels(cellchat@idents)`).
+
+And here we can also specify specific signaling pathways (`cellchat@netP$pathways`)to look at like `MIF` for instance. 
+
+```{r}
+
+# show all the significant interactions (L-R pairs) from some cell groups (defined by 'sources.use') to other cell groups (defined by 'targets.use')
+# show all the interactions sending from Inflam.FIB
+
+png("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/CD99_Chord.png",
+    width = 7, height = 7, units = "in", res = 300, bg = "white")
+
+netVisual_chord_cell(cellchat, 
+                     sources.use = sources, 
+                     targets.use = targets,
+                     signaling = c("CD99"),
+                     lab.cex = 0.5,
+                     legend.pos.y = 30)
+
+dev.off()
+
+```
+
+| Or we can specify multiple sources and a single target. 
+
+```{r}
+
+netVisual_chord_cell(cellchat, 
+                     sources.use = sources,
+                     targets.use = targets,
+                     signaling = "CD99",
+                     lab.cex = 0.5,
+                     legend.pos.y = 30)
+
+```
+
+#### 3.7.4. Violin Plots
+
+We can also plot violin plots of the expression levels of all ligands (`interaction_information$ligand`) and receptors (`interaction_information$receptor`) that are enriched in a specific pathway (`interaction_information$pathway_name`) across all cell types. 
+
+```{r}
+unique(interaction_information$pathway_name)
+
+
+png("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/violin_plot.png",
+    width = 18, height = 12, units = "in", res = 300, bg = "white")
+
+plotGeneExpression(cellchat, 
+                   signaling = c("MIF", "PECAM1"), 
+                   enriched.only = TRUE, 
+                   type = "violin")
+
+dev.off()
+
+```
+#### 3.7.5. Dominant Senders and Receivers 
+
+```{r}
+
+
+cellchat = netAnalysis_computeCentrality(cellchat, slot.name = "netP") # the slot 'netP' means the inferred intercellular communication network of signaling pathways
+
+png("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/sender_strength_plot.png",
+    width = 9, height = 4, units = "in", res = 300, bg = "white")
+
+# Visualize the computed centrality scores using heatmap, allowing ready identification of major signaling roles of cell groups
+netAnalysis_signalingRole_network(cellchat, 
+                                  signaling = c("MIF"),
+                                  width = 16, 
+                                  height = 4, 
+                                  font.size = 10)
+
+dev.off()
+
+```
+
+```{r}
+
+png("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/incoming_outgoing_strength_plot.png",
+    width = 15, height = 7, units = "in", res = 300, bg = "white")
+
+# Signaling role analysis on the aggregated cell-cell communication network from all signaling pathways
+gg1 = netAnalysis_signalingRole_scatter(cellchat)
+
+# Signaling role analysis on the cell-cell communication networks of interest
+gg2 = netAnalysis_signalingRole_scatter(cellchat, signaling = c("MIF"))
+
+gg1 + gg2
+
+dev.off()
+
+
+```
+
+| Here we can see that for `MIF` pathway, the `GMP` cells are the dominant senders compared to `ProMono`, that are the dominant receivers.
+
+```{r}
+
+gg2
+
+```
+
+We can also use heatmaps to plot the interaction strenth of individual ligands and cell types for different signaling pathways.
+
+The top colored bar plot shows the total signaling strength of a cell group by summarizing all signaling pathways displayed in the heatmap. The right grey bar plot shows the total signaling strength of a signaling pathway by summarizing all cell groups displayed in the heatmap.
+
+```{r}
+
+png("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/incoming_outgoing_heatmap.png",
+    width = 12, height = 8, units = "in", res = 300, bg = "white")
+
+ht1 = netAnalysis_signalingRole_heatmap(cellchat, pattern = "outgoing", height = 15, width = 10)
+ht2 = netAnalysis_signalingRole_heatmap(cellchat, pattern = "incoming", height = 15, width = 10)
+ht1 + ht2
+
+dev.off()
+
+```
+And of course, like everything else, we can do it for a specific pathway.
+
+```{r}
+
+png("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/incoming_outgoing_pathway_heatmap.png",
+    width = 7, height = 6, units = "in", res = 300, bg = "white")
+
+ht = netAnalysis_signalingRole_heatmap(cellchat, 
+                                       signaling = c("CD99", "MIF"),
+                                       pattern = "outgoing",
+                                       width = 14,
+                                       height = 8)
+ht
+
+dev.off()
+```
+
+#### 3.7.6. Signaling Coordination Analysis
+
+We can also see how the different incoming and outgoing singals are coordinated by the cells using the `identifyCommunicationPatterns` function. The correct paramter `k` can be selected using the `selectK` function, however, it takes a very long time to run. 
+
+How to choose the best `k`: `selectK(cellchat, pattern = "outgoing")`
+
+```{r}
+
+selectK(cellchat, pattern = "outgoing")
+
+```
+
+
+```{r}
+
+png("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/pattern_heatmap.png",
+    width = 14, height = 12, units = "in", res = 300, bg = "white")
+
+cellchat = identifyCommunicationPatterns(cellchat, 
+                                         pattern = "outgoing", 
+                                         k = 2,
+                                         height = 17,
+                                         width = 9)
+
+dev.off()
+
+```
+```{r}
+
+png("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/pattern_flow.png",
+    width = 14, height = 12, units = "in", res = 300, bg = "white")
+
+netAnalysis_river(cellchat, pattern = "outgoing")
+
+dev.off()
+
+```
+
+```{r}
+
+png("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/pattern_bubble.png",
+    width = 14, height = 8, units = "in", res = 300, bg = "white")
+
+netAnalysis_dot(cellchat, pattern = "outgoing")
+
+dev.off()
+
+```
+
+#### 3.7.7. Signaling Similarity Analysis
+
+Further, CellChat is able to quantify the similarity between all significant signaling pathways and then group them based on their cellular communication network similarity. Grouping can be done either based on the functional or structural similarity.
+
+**Functional similarity**: High degree of functional similarity indicates major senders and receivers are similar, and it can be interpreted as the two signaling pathways or two ligand-receptor pairs exhibit similar and/or redundant roles. The functional similarity analysis requires the same cell population composition between two datasets.
+
+**Structural similarity**: A structural similarity was used to compare their signaling network structure, without considering the similarity of senders and receivers.
+
+
+```{r}
+
+#cellchat = readRDS("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/cellchat.rds")
+
+set.seed(1010)
+
+cellchat = computeNetSimilarity(cellchat, 
+                                type = "functional")
+
+cellchat = netEmbedding(cellchat, 
+                        type = "functional")
+
+
+cellchat = netClustering(cellchat, 
+                         type = "functional",
+                         methods = "kmeans",
+                         k = 2)
+
+png("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/umap_functional.png",
+    width = 10, height = 7, units = "in", res = 300, bg = "white")
+
+# Visualization in 2D-space
+netVisual_embedding(cellchat, 
+                    type = "functional", 
+                    label.size = 3.5)
+
+dev.off()
+
+```
+
+We can also plot the groups individually
+
+```{r}
+
+netVisual_embeddingZoomIn(cellchat, type = "functional", nCol = 2)
+
+```
+
+```{r}
+
+set.seed(1010)
+
+cellchat = computeNetSimilarity(cellchat, 
+                                type = "structural")
+
+cellchat = netEmbedding(cellchat, 
+                        type = "structural")
+
+cellchat = netClustering(cellchat, 
+                         type = "structural",
+                         methods = "kmeans",
+                         k = 2)
+
+png("/Users/ali/Desktop/NYU/4th Semester/Single-cell Omics/Second Homework/umap_structural.png",
+    width = 10, height = 7, units = "in", res = 300, bg = "white")
+
+# Visualization in 2D-space
+netVisual_embedding(cellchat, 
+                    type = "structural", 
+                    label.size = 3.5)
+
+dev.off()
+
+
+```
+
